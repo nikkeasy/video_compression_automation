@@ -8,30 +8,47 @@ import threading
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+def resolve_handbrake_path(path_str):
+    if path_str:
+        clean = path_str.strip().strip('"').strip("'")
+        if os.path.isfile(clean):
+            return clean
+        if os.path.isdir(clean):
+            for candidate in ("HandBrakeCLI.exe", "HandBrakeCLI"):
+                full = os.path.join(clean, candidate)
+                if os.path.isfile(full):
+                    return full
+    defaults = [
+        r"C:\Program Files\HandBrake\CLI\HandBrakeCLI.exe",
+        r"C:\Program Files\HandBrake\HandBrakeCLI.exe",
+    ]
+    for d in defaults:
+        if os.path.isfile(d):
+            return d
+    which_hb = shutil.which("HandBrakeCLI") or shutil.which("HandBrakeCLI.exe")
+    if which_hb:
+        return which_hb
+    return path_str.strip().strip('"').strip("'") if path_str else None
+
+def has_nvidia_gpu():
+    return shutil.which("nvidia-smi") is not None
+
 # --- CONFIGURATION: EDIT THESE SETTINGS IN .env ---
 load_dotenv()
-# Full path to the HandBrakeCLI.exe. Use forward slashes.
-HANDBRAKE_CLI_PATH = os.getenv("HANDBRAKE_CLI_PATH")         # e.g. "C:/Program Files/HandBrake/HandBrakeCLI.exe"
-
-# The PARENT folder where the script looks for videos.
+HANDBRAKE_CLI_PATH = resolve_handbrake_path(os.getenv("HANDBRAKE_CLI_PATH"))
 INPUT_FOLDER = os.getenv("INPUT_FOLDER")                     # Root folder to scan for videos, e.g. "C:/Videos/Game Recordings"
-
-# The FINAL destination for compressed files.
-# LEAVE THIS BLANK ("") in .env to keep compressed files in the same folder as their originals.
 TARGET_FOLDER = os.getenv("TARGET_FOLDER")                   # Final destination for compressed files, e.g. "C:/Videos/Compressed"
-
-# The quality setting for the NVENC H.265 encoder. 18-22 is a good range.
 QUALITY_RF = int(os.getenv("QUALITY_RF", "20"))              # e.g. 20-22 for near-lossless, higher = smaller files
-POSTFIX = os.getenv("POSTFIX")                               # e.g. "_compressed"
+POSTFIX = os.getenv("POSTFIX", "_compressed") or "_compressed"
 VIDEO_EXTENSIONS = tuple(ext.strip().lower() for ext in os.getenv("VIDEO_EXTENSIONS", ".mp4,.mkv,.DVR").split(","))  # Generally mp4, mkv, DVR etc. Comma-separated in .env
 MIN_FILE_SIZE_MB = int(os.getenv("MIN_FILE_SIZE_MB", "30"))  # Skip files smaller than this (MB), e.g. 30
 
 # Encoding flags for the HandBrake command.
-ENCODER = os.getenv("ENCODER")                               # e.g. "nvenc_h265" for NVIDIA GPU, "x265" for CPU
-PRESET = os.getenv("PRESET")                                 # e.g. "fast", "medium", or "Hardware/H.265 NVENC 1080p"
+ENCODER = os.getenv("ENCODER") or ("nvenc_h265" if has_nvidia_gpu() else "x265")
+PRESET = os.getenv("PRESET", "fast" if ENCODER == "x265" else None)
 
-# Parallel Processing: Number of files to process at the same time. Start with 2 or 3.
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))             # e.g. 3
+# Parallel Processing: Number of files to process at the same time.
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1" if ENCODER == "x265" else "3"))
 # --- END OF CONFIGURATION ---
 
 # A global lock for thread-safe printing to prevent garbled output

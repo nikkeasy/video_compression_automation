@@ -4,6 +4,7 @@ import subprocess
 import argparse
 import shutil
 import time
+import queue
 import threading
 import concurrent.futures
 from tqdm import tqdm
@@ -13,24 +14,54 @@ from dotenv import load_dotenv
 # (uv pipes output, which makes Python fully-buffer stdout and hide output for minutes).
 sys.stdout.reconfigure(line_buffering=True)
 
-# --- CONFIGURATION: EDIT THESE SETTINGS IN .env ---
-# LOAD ENV variables
+def resolve_handbrake_path(path_str):
+    """
+    Locates the HandBrakeCLI executable.
+    Handles direct file paths, directory paths, common install locations, and PATH.
+    """
+    if path_str:
+        clean = path_str.strip().strip('"').strip("'")
+        if os.path.isfile(clean):
+            return clean
+        if os.path.isdir(clean):
+            for candidate in ("HandBrakeCLI.exe", "HandBrakeCLI"):
+                full = os.path.join(clean, candidate)
+                if os.path.isfile(full):
+                    return full
+    # Check common default paths on Windows
+    defaults = [
+        r"C:\Program Files\HandBrake\CLI\HandBrakeCLI.exe",
+        r"C:\Program Files\HandBrake\HandBrakeCLI.exe",
+    ]
+    for d in defaults:
+        if os.path.isfile(d):
+            return d
+    # Check system PATH
+    which_hb = shutil.which("HandBrakeCLI") or shutil.which("HandBrakeCLI.exe")
+    if which_hb:
+        return which_hb
+    return path_str.strip().strip('"').strip("'") if path_str else None
 
+def has_nvidia_gpu():
+    """Checks if an NVIDIA GPU is available via nvidia-smi."""
+    return shutil.which("nvidia-smi") is not None
+
+# --- CONFIGURATION: EDIT THESE SETTINGS IN .env ---
 load_dotenv()
 INPUT_FOLDER = os.getenv("INPUT_FOLDER")                     # Root folder to scan for videos, e.g. "C:/Videos/Game Recordings"
 TARGET_FOLDER = os.getenv("TARGET_FOLDER")                   # Final destination for compressed files, e.g. "C:/Users/you/OneDrive/Media"
 
-# Full path to the HandBrakeCLI.exe. Use forward slashes.
-HANDBRAKE_CLI_PATH = os.getenv("HANDBRAKE_CLI_PATH")         # e.g. "C:/Program Files/HandBrake/HandBrakeCLI.exe"
+# Full path to HandBrakeCLI.exe or its parent folder.
+HANDBRAKE_CLI_PATH = resolve_handbrake_path(os.getenv("HANDBRAKE_CLI_PATH"))
 
 # The quality setting for the H.265 encoder. Lower = better quality/bigger file. 18-28 is a good range.
 QUALITY_RF = int(os.getenv("QUALITY_RF", "20"))              # e.g. 20-22 for near-lossless, higher = smaller files
 
 # The text to add to compressed files.
-POSTFIX = os.getenv("POSTFIX")                               # e.g. "_compressed"
+POSTFIX = os.getenv("POSTFIX", "_compressed") or "_compressed" # e.g. "_compressed"
 
 # File extensions to look for.
-VIDEO_EXTENSIONS = tuple(ext.strip().lower() for ext in os.getenv("VIDEO_EXTENSIONS", ".mp4,.mkv").split(","))  # Generally mp4, mkv etc. Comma-separated in .env
+VIDEO_EXTENSIONS = tuple(ext.strip().lower() for ext in os.getenv("VIDEO_EXTENSIONS", ".mp4,.mkv").split(","))  # Comma-separated in .env
 
 # Files smaller than this (in MB) will be skipped entirely.
 MIN_FILE_SIZE_MB = int(os.getenv("MIN_FILE_SIZE_MB", "30"))  # e.g. 30
@@ -50,7 +81,7 @@ THUMBNAIL_EMBED = os.getenv("THUMBNAIL_EMBED", "false")       # e.g. "true" — 
 FFMPEG_PATH = shutil.which("ffmpeg")
 
 # How many videos to compress in parallel. Can be overridden at runtime with --workers.
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))             # e.g. 2-3 is the sweet spot for a single GPU
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))             # e.g. 2-3 for GPU, 1 for CPU
 
 # Lock for thread-safe printing (parallel workers share the console).
 print_lock = threading.Lock()
@@ -158,8 +189,16 @@ def process_single_video(job_info, slot):
     """
     input_path, filename = job_info
     name_part, ext_part = os.path.splitext(filename)
-    output_filename = f"{name_part}{POSTFIX}{ext_part}"
+    postfix_str = POSTFIX if POSTFIX else "_compressed"
+    output_filename = f"{name_part}{postfix_str}{ext_part}"
     temp_output_path = os.path.join(os.path.dirname(input_path), output_filename)
+
+    # Clean up any leftover partial file from previous interrupted runs
+    if os.path.exists(temp_output_path):
+        try:
+            os.remove(temp_output_path)
+        except OSError:
+            pass
 
     file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
     with print_lock:
@@ -167,15 +206,16 @@ def process_single_video(job_info, slot):
         print(f"[Worker {slot}] Found large video: '{filename}' ({file_size_mb:.1f}MB) in '{os.path.dirname(input_path)}'")
         print(f"[Worker {slot}] Compressing to: {output_filename}...")
 
+    # Build HandBrakeCLI command (guaranteed non-None arguments)
     command = [
         HANDBRAKE_CLI_PATH, "-i", input_path, "-o", temp_output_path,
-        "--encoder", ENCODER, "--quality", str(QUALITY_RF)
+        "--encoder", str(ENCODER), "--quality", str(QUALITY_RF)
     ]
     if PRESET:
-        command.extend(["--preset", PRESET])
+        command.extend(["--preset", str(PRESET)])
     if AENCODER:
-        command.extend(["--aencoder", AENCODER])
-    if HW_DECODE and HW_DECODE.strip().lower() == "true":
+        command.extend(["--aencoder", str(AENCODER)])
+    if HW_DECODE and str(HW_DECODE).strip().lower() == "true":
         command.append("--hwdecode")
 
     try:
@@ -238,10 +278,14 @@ def process_single_video(job_info, slot):
         if TARGET_FOLDER:
             os.makedirs(TARGET_FOLDER, exist_ok=True)
             final_destination_path = os.path.join(TARGET_FOLDER, output_filename)
-            print(f"[Worker {slot}] Moving compressed file to: {final_destination_path}")
-            shutil.move(temp_output_path, final_destination_path)
-            with print_lock:
-                print(f"[Worker {slot}] Move successful!")
+            if os.path.abspath(temp_output_path) != os.path.abspath(final_destination_path):
+                print(f"[Worker {slot}] Moving compressed file to: {final_destination_path}")
+                shutil.move(temp_output_path, final_destination_path)
+                with print_lock:
+                    print(f"[Worker {slot}] Move successful!")
+            else:
+                with print_lock:
+                    print(f"[Worker {slot}] Compressed file saved in target folder: {temp_output_path}")
 
         with print_lock:
             print(f"[Worker {slot}] Deleting original file: {filename}")
@@ -275,14 +319,16 @@ def compress_and_move_videos(max_workers):
     total_size_mb = 0.0
     folders_scanned = 0
 
+    postfix_check = POSTFIX if POSTFIX else "_compressed"
+
     # Phase 1: scan for eligible files
     for root, dirs, files in os.walk(INPUT_FOLDER):
         folders_scanned += 1
         if folders_scanned % 20 == 0:
             print(f"    ...scanned {folders_scanned} folders so far (found {len(job_info_list)} video(s))...")
         for filename in files:
-            # Check if the file is a video we should consider
-            if filename.lower().endswith(VIDEO_EXTENSIONS) and POSTFIX not in filename:
+            # Check if the file is a video we should consider (avoid re-compressing already processed files)
+            if filename.lower().endswith(VIDEO_EXTENSIONS) and postfix_check not in filename and "_compressed" not in filename:
                 input_path = os.path.join(root, filename)
 
                 # Skip files that are too small to be worth compressing
@@ -308,11 +354,22 @@ def compress_and_move_videos(max_workers):
 
     start_time = time.time()
 
-    # Phase 2: process in parallel, each worker gets its own progress bar slot
+    # Slot queue so progress bar position stays within [0, max_workers - 1]
+    slot_queue = queue.Queue()
+    for s in range(max_workers):
+        slot_queue.put(s)
+
+    def worker_wrapper(job):
+        slot = slot_queue.get()
+        try:
+            return process_single_video(job, slot)
+        finally:
+            slot_queue.put(slot)
+
+    # Phase 2: process in parallel
     successful_count = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_single_video, job, slot): job
-                   for slot, job in enumerate(job_info_list)}
+        futures = {executor.submit(worker_wrapper, job): job for job in job_info_list}
         for future in concurrent.futures.as_completed(futures):
             if future.result():
                 successful_count += 1
@@ -331,14 +388,97 @@ def compress_and_move_videos(max_workers):
         print(f"Total task duration: {duration_str}")
         return False
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compresses/moves videos in parallel (with progress bars). Use --onedrive to pause/resume OneDrive sync around the run.")
+    parser = argparse.ArgumentParser(
+        description="Compresses/moves videos in parallel with live progress bars. "
+                    "Use --gpu for NVIDIA GPUs, --cpu for basic laptops, or --qsv for Intel QuickSync."
+    )
+    parser.add_argument('--gpu', action='store_true', help="Use NVIDIA GPU hardware encoder (nvenc_h265) and HW decoding.")
+    parser.add_argument('--cpu', action='store_true', help="Use CPU encoder (x265) with safe single-worker default, ideal for basic laptops.")
+    parser.add_argument('--qsv', action='store_true', help="Use Intel QuickSync hardware encoder (qsv_h265), great for Intel laptops.")
+    parser.add_argument('--encoder', type=str, default=None, help="Specify HandBrake encoder (e.g. nvenc_h265, x265, qsv_h265). Overrides .env")
+    parser.add_argument('--preset', type=str, default=None, help="Specify HandBrake preset (e.g. fast, medium). Overrides .env")
+    parser.add_argument('-q', '--quality', '--rf', dest='quality_rf', type=int, default=None, help="RF Quality value (lower = better quality/bigger file, e.g. 20-24). Overrides .env")
+    parser.add_argument('--workers', type=int, default=None, help="Number of parallel compression workers. Overrides MAX_WORKERS from .env")
+    parser.add_argument('--onedrive', action='store_true', help="Stop OneDrive before compression and restart it after (prevents sync conflicts).")
     parser.add_argument('--shutdown', action='store_true', help="Shutdown computer after the script completes.")
-    parser.add_argument('--workers', type=int, default=None, help="Number of parallel compression workers. Overrides MAX_WORKERS from .env (e.g. --workers 2)")
-    parser.add_argument('--onedrive', action='store_true', help="Stop OneDrive before compression and restart it after (prevents sync conflicts). By default OneDrive is left untouched.")
     args = parser.parse_args()
 
-    workers = args.workers if args.workers is not None else MAX_WORKERS
+    # 1. Resolve Encoder & HW Decoding
+    if args.gpu:
+        ENCODER = "nvenc_h265"
+        HW_DECODE = "true"
+    elif args.cpu:
+        ENCODER = "x265"
+        HW_DECODE = "false"
+        if not args.preset and not PRESET:
+            PRESET = "fast"
+    elif args.qsv:
+        ENCODER = "qsv_h265"
+        HW_DECODE = "false"
+    elif args.encoder:
+        ENCODER = args.encoder
+    elif not ENCODER:
+        # Auto-detect encoder if not provided in .env
+        if has_nvidia_gpu():
+            ENCODER = "nvenc_h265"
+            HW_DECODE = "true"
+            print("[Auto-detect] NVIDIA GPU detected -> default encoder set to nvenc_h265")
+        else:
+            ENCODER = "x265"
+            HW_DECODE = "false"
+            if not PRESET:
+                PRESET = "fast"
+            print("[Auto-detect] No NVIDIA GPU detected -> falling back to universal CPU encoder: x265")
+
+    # 2. Resolve Preset
+    if args.preset:
+        PRESET = args.preset
+
+    # 3. Resolve Quality RF
+    if args.quality_rf is not None:
+        QUALITY_RF = args.quality_rf
+
+    # 4. Resolve Workers
+    if args.workers is not None:
+        workers = args.workers
+    elif args.cpu or ENCODER == "x265":
+        workers = 1  # Safe laptop/CPU default: 1 worker avoids pegging all cores to 100%
+    else:
+        workers = MAX_WORKERS
+
+    # 5. Sanity Checks on HandBrake and Input Folder
+    if not HANDBRAKE_CLI_PATH or not os.path.isfile(HANDBRAKE_CLI_PATH):
+        print("=" * 60)
+        print("ERROR: HandBrakeCLI executable not found!")
+        print(f"Current resolved path: {HANDBRAKE_CLI_PATH}")
+        print("Please verify HANDBRAKE_CLI_PATH in .env or ensure HandBrakeCLI is installed.")
+        print('Example: HANDBRAKE_CLI_PATH = "C:/Program Files/HandBrake/CLI/HandBrakeCLI.exe"')
+        print("=" * 60)
+        sys.exit(1)
+
+    if not INPUT_FOLDER or not os.path.exists(INPUT_FOLDER):
+        print("=" * 60)
+        print("ERROR: INPUT_FOLDER does not exist or is not set in .env:")
+        print(f"INPUT_FOLDER: {INPUT_FOLDER}")
+        print("Please check your .env configuration.")
+        print("=" * 60)
+        sys.exit(1)
+
+    # 6. Display Configuration Banner
+    print("=" * 60)
+    print("Video Compression Automation (Subfolders)")
+    print("=" * 60)
+    print(f"HandBrakeCLI : {HANDBRAKE_CLI_PATH}")
+    print(f"Input Folder : {INPUT_FOLDER}")
+    print(f"Target Folder: {TARGET_FOLDER if TARGET_FOLDER else '(Same as input)'}")
+    print(f"Encoder      : {ENCODER}")
+    print(f"Preset       : {PRESET if PRESET else '(default)'}")
+    print(f"Quality (RF) : {QUALITY_RF}")
+    print(f"Workers      : {workers}")
+    print(f"HW Decode    : {HW_DECODE}")
+    print("=" * 60 + "\n")
 
     work_was_done = False
     if args.onedrive:
@@ -346,7 +486,6 @@ if __name__ == "__main__":
             stop_onedrive()
             work_was_done = compress_and_move_videos(max_workers=workers)
         finally:
-            # This 'finally' block ensures OneDrive is ALWAYS restarted, even if the script crashes.
             start_onedrive()
     else:
         work_was_done = compress_and_move_videos(max_workers=workers)

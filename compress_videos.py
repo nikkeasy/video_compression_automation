@@ -7,19 +7,43 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- CONFIGURATION: EDIT THESE SETTINGS ---
+def resolve_handbrake_path(path_str):
+    if path_str:
+        clean = path_str.strip().strip('"').strip("'")
+        if os.path.isfile(clean):
+            return clean
+        if os.path.isdir(clean):
+            for candidate in ("HandBrakeCLI.exe", "HandBrakeCLI"):
+                full = os.path.join(clean, candidate)
+                if os.path.isfile(full):
+                    return full
+    defaults = [
+        r"C:\Program Files\HandBrake\CLI\HandBrakeCLI.exe",
+        r"C:\Program Files\HandBrake\HandBrakeCLI.exe",
+    ]
+    for d in defaults:
+        if os.path.isfile(d):
+            return d
+    which_hb = shutil.which("HandBrakeCLI") or shutil.which("HandBrakeCLI.exe")
+    if which_hb:
+        return which_hb
+    return path_str.strip().strip('"').strip("'") if path_str else None
+
+def has_nvidia_gpu():
+    return shutil.which("nvidia-smi") is not None
+
 # --- CONFIGURATION: EDIT THESE SETTINGS IN .env ---
 # NOTE: This script scans ONE flat folder (no subfolders) and works in that same folder.
-HANDBRAKE_CLI_PATH = os.getenv("HANDBRAKE_CLI_PATH")         # Path to HandBrakeCLI.exe, e.g. "C:/Program Files/HandBrake/HandBrakeCLI.exe"
+HANDBRAKE_CLI_PATH = resolve_handbrake_path(os.getenv("HANDBRAKE_CLI_PATH"))
 INPUT_FOLDER = os.getenv("INPUT_FOLDER")                     # Folder to scan for videos, e.g. "C:/Downloads"
 ONEDRIVE_FOLDER = os.getenv("ONEDRIVE_FOLDER")               # Final destination, e.g. "C:/Users/username/OneDrive/Media/Game Recordings". Leave empty to skip the move.
 QUALITY_RF = int(os.getenv("QUALITY_RF", "22"))              # H.265 quality (lower = better), e.g. 20-22 for near-lossless
-POSTFIX = os.getenv("POSTFIX")                               # e.g. "_compressed"
+POSTFIX = os.getenv("POSTFIX", "_compressed") or "_compressed"
 VIDEO_EXTENSIONS = tuple(ext.strip().lower() for ext in os.getenv("VIDEO_EXTENSIONS", ".mp4,.mkv").split(","))  # Generally mp4, mkv etc. Comma-separated in .env
 
 # Encoding flags for the HandBrake command.
-ENCODER = os.getenv("ENCODER")                               # e.g. "nvenc_h265" for NVIDIA GPU, "x265" for CPU
-PRESET = os.getenv("PRESET")                                 # e.g. "fast", "medium", or "Hardware/H.265 NVENC 1080p"
+ENCODER = os.getenv("ENCODER") or ("nvenc_h265" if has_nvidia_gpu() else "x265")
+PRESET = os.getenv("PRESET", "fast" if ENCODER == "x265" else None)
 AENCODER = os.getenv("AENCODER")                             # e.g. "copy" for audio passthrough, leave empty to re-encode audio
 # --- END OF CONFIGURATION ---
 
