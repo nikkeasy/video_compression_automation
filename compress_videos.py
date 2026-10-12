@@ -101,7 +101,20 @@ def compress_and_move_videos():
             try:
                 print(f"Compressing to: {output_filename}...")
                 subprocess.run(command, capture_output=True, text=True, check=True)
-                print("Compression successful!")
+                compressed_size = os.path.getsize(temp_output_path)
+                original_size = os.path.getsize(input_path)
+
+                # SIZE SAFETY GATE: Never replace an original with a larger file!
+                if compressed_size >= original_size:
+                    print(f"⚠️ SIZE WARNING: Compressed output ({compressed_size / (1024 * 1024):.1f} MB) is LARGER than original ({original_size / (1024 * 1024):.1f} MB).")
+                    print("Discarding bloated compressed file and keeping original.")
+                    if os.path.exists(temp_output_path):
+                        os.remove(temp_output_path)
+                    print("="*60 + "\n")
+                    continue
+
+                savings_pct = ((original_size - compressed_size) / original_size) * 100
+                print(f"Compression successful! ({compressed_size / (1024 * 1024):.1f} MB vs {original_size / (1024 * 1024):.1f} MB original | -{savings_pct:.1f}% space saved)")
                 if ONEDRIVE_FOLDER:
                     os.makedirs(ONEDRIVE_FOLDER, exist_ok=True)
                     final_destination_path = os.path.join(ONEDRIVE_FOLDER, output_filename)

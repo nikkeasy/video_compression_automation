@@ -268,9 +268,24 @@ def process_single_video(job_info, slot):
                 raise RuntimeError("Safety gate: compressed output is suspiciously small (<1MB). Keeping original.")
 
         compressed_size = os.path.getsize(temp_output_path)
+        original_size = os.path.getsize(input_path)
 
+        # SIZE SAFETY GATE: Never replace an original with a larger file!
+        if compressed_size >= original_size:
+            with print_lock:
+                print(f"[Worker {slot}] ⚠️ SIZE WARNING: Compressed output ({compressed_size / (1024 * 1024):.1f} MB) is LARGER than original ({file_size_mb:.1f} MB).")
+                print(f"[Worker {slot}] Discarding bloated compressed file and keeping original.")
+            if os.path.exists(temp_output_path):
+                try:
+                    os.remove(temp_output_path)
+                except OSError:
+                    pass
+            print("=" * 60)
+            return False
+
+        savings_pct = ((original_size - compressed_size) / original_size) * 100
         with print_lock:
-            print(f"[Worker {slot}] Compression successful! ({compressed_size / (1024 * 1024):.1f} MB vs {file_size_mb:.1f} MB original)")
+            print(f"[Worker {slot}] Compression successful! ({compressed_size / (1024 * 1024):.1f} MB vs {file_size_mb:.1f} MB original | -{savings_pct:.1f}% space saved)")
 
         # Embed a thumbnail from the ORIGINAL into the compressed file (before original is deleted)
         embed_thumbnail(input_path, temp_output_path, slot)
